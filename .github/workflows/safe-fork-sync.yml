@@ -1,0 +1,104 @@
+name: Safe Fork Sync
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只检查上游和安全条件，不更新 main"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: safe-fork-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.repository == 'CaptainUnhappy/pansou-SafeFork' &&
+      github.ref == 'refs/heads/sync-control' &&
+      (github.event_name != 'schedule' || vars.FORK_SYNC_PAUSED != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.FORK_SYNC_PAT || github.token }}
+      UPSTREAM_REPO: fish2018/pansou
+      SYNC_BRANCH: main
+      MIN_FILE_PERCENT: "40"
+      MIN_FILE_COUNT: "3"
+      DRY_RUN: ${{ inputs.dry_run || false }}
+    steps:
+      - name: 检查上游并通过 GitHub API 快进同步
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::同步未完成，请查看失败请求。若提示 workflow 权限不足，请配置 FORK_SYNC_PAT。"' ERR
+
+          report() {
+            printf '%s\n' "$1"
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')
+          if [ "$parent" != "$UPSTREAM_REPO" ]; then
+            report "::error::Fork 上游关系已变化，停止同步，请人工确认。"
+            exit 1
+          fi
+
+          # 锁定两个提交；后续比较、文件检查和更新均使用这些 SHA。
+          before=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SYNC_BRANCH" --jq '.object.sha')
+          upstream=$(gh api "repos/$UPSTREAM_REPO/git/ref/heads/$SYNC_BRANCH" --jq '.object.sha')
+          report "Fork $SYNC_BRANCH：$before"
+          report "上游 $UPSTREAM_REPO / $SYNC_BRANCH：$upstream"
+
+          if [ "$before" = "$upstream" ]; then
+            report "已经与上游一致，无需更新。"
+            exit 0
+          fi
+
+          relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$before...$upstream" --jq '.status')
+          if [ "$relation" != "ahead" ]; then
+            report "::error::上游不是 Fork 的快进后继（$relation）。可能有独立提交或上游重写历史，停止同步。"
+            exit 1
+          fi
+
+          count_files() {
+            gh api "repos/$1/git/trees/$2?recursive=1" --jq '
+              if .truncated == false then
+                [.tree[] | select(.type == "blob" or .type == "commit")] | length
+              else error("文件列表不完整，停止同步。") end'
+          }
+
+          current_count=$(count_files "$GITHUB_REPOSITORY" "$before")
+          upstream_count=$(count_files "$UPSTREAM_REPO" "$upstream")
+          report "文件数：Fork $current_count，上游 $upstream_count。"
+          if (( upstream_count < MIN_FILE_COUNT || upstream_count * 100 < current_count * MIN_FILE_PERCENT )); then
+            report "::error::上游文件数异常下降，停止同步，请人工确认。"
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            report "检查通过：可以快进。当前是只检查模式，未更新 main。"
+            exit 0
+          fi
+
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SYNC_BRANCH" --jq '.object.sha')
+          if [ "$latest" != "$before" ]; then
+            report "::error::检查期间 main 被其他操作更新，停止本次同步，请重新运行。"
+            exit 1
+          fi
+
+          # GitHub 在服务端强制检查 fast-forward；不会创建 commit 或 tag。
+          updated=$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$SYNC_BRANCH" \
+            -f sha="$upstream" -F force=false --jq '.object.sha')
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SYNC_BRANCH" --jq '.object.sha')
+          if [ "$updated" != "$upstream" ] || [ "$actual" != "$upstream" ]; then
+            report "::error::同步后的 SHA 校验失败，请检查 main 是否被其他操作更新。"
+            exit 1
+          fi
+          report "同步成功：main 已快进至 $upstream。没有新增同步提交或标签。"
