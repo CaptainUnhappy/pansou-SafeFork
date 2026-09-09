@@ -3,6 +3,8 @@ name: Safe Fork Sync
 on:
   schedule:
     - cron: "17 * * * *"
+    # 临时验证定时触发；出现成功的 schedule 运行后移除。
+    - cron: "3/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
