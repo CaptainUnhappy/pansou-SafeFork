@@ -19,6 +19,6 @@ git clone --branch main https://github.com/CaptainUnhappy/pansou-SafeFork.git
 
 同步前会验证 Fork 的上游关系、所有来源引用快照、分支快进关系和并发变化。主分支文件数不足 3 个或降至当前的 40% 以下时会停止。任一分支分叉、标签冲突或 API 异常都会在写入前终止。
 
-默认使用 `GITHUB_TOKEN`。若上游提交修改了 `.github/workflows/`，请配置仅授权本仓库 Contents 与 Workflows 写权限的 `FORK_SYNC_PAT`；不要把 token 写入文件。
+工作流用只读 `GITHUB_TOKEN` 做检查，用仅能写入本仓库的 `SAFEFORK_DEPLOY_KEY` 推送引用，因此上游提交涉及 `.github/workflows/` 时也不会要求广域 PAT。私钥只存于 Actions Secret。
 
 回滚测试、冲突处理与新仓库接入步骤见 [SafeFork 规范](https://github.com/CaptainUnhappy/SafeFork/blob/main/skills/safefork/references/spec.md)。
