@@ -1,3 +1,6 @@
+# Copyright (c) 2026 CaptainUnhappy
+# SPDX-License-Identifier: MPL-2.0
+
 name: Safe Fork Sync
 
 on:
@@ -6,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "只检查所有上游分支和标签，不写入"
+        description: "Check all upstream branches and tags without writing"
         type: boolean
         default: false
 
@@ -14,44 +17,51 @@ permissions:
   contents: read
 
 concurrency:
-  group: safe-fork-sync
+  group: safefork-sync
   cancel-in-progress: false
 
 jobs:
   sync:
     if: >-
-      github.repository == 'CaptainUnhappy/pansou-SafeFork' &&
-      github.ref == 'refs/heads/sync-control' &&
-      (github.event_name != 'schedule' || vars.FORK_SYNC_PAUSED != 'true')
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name != 'schedule' || vars.SAFEFORK_PAUSED != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      GH_TOKEN: ${{ secrets.FORK_SYNC_PAT || github.token }}
+      SAFEFORK_TEMPLATE_VERSION: "2026-09-24.1"
+      GH_TOKEN: ${{ github.token }}
       SAFEFORK_DEPLOY_KEY: ${{ secrets.SAFEFORK_DEPLOY_KEY }}
-      UPSTREAM_REPO: fish2018/pansou
-      CONTROL_BRANCH: sync-control
-      PRIMARY_BRANCH: main
-      MIN_FILE_PERCENT: "40"
-      MIN_FILE_COUNT: "3"
+      UPSTREAM_REPO: ${{ vars.SAFEFORK_UPSTREAM }}
+      CONTROL_BRANCH: ${{ github.event.repository.default_branch }}
+      PRIMARY_BRANCH: ${{ vars.SAFEFORK_PRIMARY_BRANCH || 'main' }}
+      MIN_FILE_PERCENT: ${{ vars.SAFEFORK_MIN_FILE_PERCENT || '40' }}
+      MIN_FILE_COUNT: ${{ vars.SAFEFORK_MIN_FILE_COUNT || '3' }}
       DRY_RUN: ${{ inputs.dry_run || false }}
     steps:
-      - name: 规划、校验并同步安全的 Git 引用
+      - name: Plan, validate, and synchronize safe Git refs
         shell: bash
         run: |
           set -euo pipefail
           push_dir=
+          writes=0
 
           cleanup() {
             [ -z "$push_dir" ] || rm -rf -- "$push_dir"
           }
 
-          trap cleanup EXIT
-          trap 'echo "::error::同步未完成；已完成的引用会列在摘要中。"' ERR
-
           report() {
             printf '%s\n' "$1"
             printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
           }
+
+          fail_summary() {
+            report "::error::Sync did not complete after writing $writes ref(s); completed writes are listed above."
+          }
+
+          trap cleanup EXIT
+          trap fail_summary ERR
+
+          report "SafeFork template version: $SAFEFORK_TEMPLATE_VERSION"
 
           list_refs() {
             gh api "repos/$1/git/matching-refs/$2/" --paginate --jq '.[] | [.ref, .object.sha] | @tsv'
@@ -60,8 +70,8 @@ jobs:
           count_files() {
             gh api "repos/$1/git/trees/$2?recursive=1" --jq '
               if .truncated == false then
-                [.tree[] | select(.type == "blob" or .type == "commit")] | length
-              else error("文件列表不完整，停止同步。") end'
+                [.tree[] | select(.type == "blob")] | length
+              else error("The recursive tree is truncated.") end'
           }
 
           verify_ref() {
@@ -73,13 +83,26 @@ jobs:
               fi
               sleep "$attempt"
             done
-            report "::error::$ref 写入后的 SHA 校验失败；预期 $expected，实际 ${actual:-无法读取}。"
+            report "::error::$ref verification failed; expected $expected, got ${actual:-unavailable}."
+            return 1
+          }
+
+          require_ref_absent() {
+            local ref=$1 response
+            if response=$(gh api --include "repos/$GITHUB_REPOSITORY/git/ref/$ref" 2>&1); then
+              report "::error::Target $ref was created during planning."
+              return 1
+            fi
+            if [[ "$response" == *"HTTP 404"* ]]; then
+              return 0
+            fi
+            report "::error::Unable to verify that target $ref is absent; fail closed."
             return 1
           }
 
           configure_push() {
             if [ -z "${SAFEFORK_DEPLOY_KEY:-}" ]; then
-              report "::error::存在待写入引用，但未配置仓库专用的 SAFEFORK_DEPLOY_KEY。"
+              report "::error::Writes are planned, but repository-scoped SAFEFORK_DEPLOY_KEY is not configured."
               return 1
             fi
             push_dir=$(mktemp -d)
@@ -93,23 +116,27 @@ jobs:
           push_ref() {
             local kind=$1 name=$2 expected=$3 staged actual
             staged="refs/safefork/$kind/$name"
-            git -C "$push_dir" fetch --quiet --no-tags --depth=1 "https://github.com/$UPSTREAM_REPO.git" "refs/$kind/$name:$staged"
+            # Ordinary push needs complete ancestry to prove a fast-forward.
+            git -C "$push_dir" fetch --quiet --no-tags "https://github.com/$UPSTREAM_REPO.git" "refs/$kind/$name:$staged"
             actual=$(git -C "$push_dir" rev-parse "$staged")
             if [ "$actual" != "$expected" ]; then
-              report "::error::$kind/$name 抓取到的 SHA 与锁定值不一致。"
+              report "::error::$kind/$name fetched SHA differs from the locked source SHA."
               return 1
             fi
             git -C "$push_dir" push --quiet "git@github.com:$GITHUB_REPOSITORY.git" "$staged:refs/$kind/$name"
             verify_ref "$kind/$name" "$expected"
           }
 
+          if [ -z "$UPSTREAM_REPO" ]; then
+            report "::error::SAFEFORK_UPSTREAM is not configured."
+            exit 1
+          fi
           parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')
           if [ "$parent" != "$UPSTREAM_REPO" ]; then
-            report "::error::Fork 上游关系已变化，停止同步，请人工确认。"
+            report "::error::Fork parent differs from SAFEFORK_UPSTREAM; manual review required."
             exit 1
           fi
 
-          # 锁定来源与目标快照。只处理上游拥有的引用；Fork 独有引用保留。
           upstream_heads_raw=$(list_refs "$UPSTREAM_REPO" heads)
           upstream_tags_raw=$(list_refs "$UPSTREAM_REPO" tags)
           fork_heads_raw=$(list_refs "$GITHUB_REPOSITORY" heads)
@@ -140,20 +167,19 @@ jobs:
           done <<< "$fork_tags_raw"
 
           if [ "${#upstream_heads[@]}" -eq 0 ]; then
-            report "::error::上游没有可读取的分支，停止同步。"
+            report "::error::No upstream branches were returned."
             exit 1
           fi
           if [ -n "${upstream_heads[$CONTROL_BRANCH]+present}" ]; then
-            report "::error::上游存在保留分支 $CONTROL_BRANCH；为保护调度控制面，停止同步。"
+            report "::error::Upstream contains reserved control branch $CONTROL_BRANCH."
             exit 1
           fi
 
-          # 先完成所有只读规划；任一冲突都会在第一次写入前停止。
           for branch in "${!upstream_heads[@]}"; do
             source_sha=${upstream_heads[$branch]}
             if [ -z "${fork_heads[$branch]+present}" ]; then
               create_branches+=("$branch")
-              report "计划：创建分支 $branch -> $source_sha"
+              report "Plan: create branch $branch -> $source_sha"
               continue
             fi
 
@@ -161,79 +187,100 @@ jobs:
             [ "$target_sha" = "$source_sha" ] && continue
             relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$target_sha...$source_sha" --jq '.status')
             if [ "$relation" != "ahead" ]; then
-              report "::error::分支 $branch 不是安全快进（$relation）；停止同步且不写入。"
+              report "::error::Branch $branch is not a safe fast-forward ($relation); zero writes."
               exit 1
             fi
 
             if [ "$branch" = "$PRIMARY_BRANCH" ]; then
               current_count=$(count_files "$GITHUB_REPOSITORY" "$target_sha")
               upstream_count=$(count_files "$UPSTREAM_REPO" "$source_sha")
-              report "主分支文件数：Fork $current_count，上游 $upstream_count。"
+              report "Primary branch file count: Fork $current_count, upstream $upstream_count."
               if (( upstream_count < MIN_FILE_COUNT || upstream_count * 100 < current_count * MIN_FILE_PERCENT )); then
-                report "::error::上游主分支文件数异常下降，停止同步，请人工确认。"
+                report "::error::Upstream primary branch file count dropped beyond the configured gate."
                 exit 1
               fi
             fi
 
             update_branches+=("$branch")
-            report "计划：快进分支 $branch，$target_sha -> $source_sha"
+            report "Plan: fast-forward branch $branch, $target_sha -> $source_sha"
           done
 
           for tag in "${!upstream_tags[@]}"; do
             source_sha=${upstream_tags[$tag]}
             if [ -z "${fork_tags[$tag]+present}" ]; then
               create_tags+=("$tag")
-              report "计划：复制不可变标签 $tag -> $source_sha"
+              report "Plan: copy immutable tag $tag -> $source_sha"
             elif [ "${fork_tags[$tag]}" != "$source_sha" ]; then
-              report "::error::标签 $tag 同名但 SHA 不同；SafeFork 禁止移动标签，停止同步且不写入。"
+              report "::error::Tag $tag has the same name but a different SHA; tags are immutable."
               exit 1
             fi
           done
 
-          report "计划汇总：新分支 ${#create_branches[@]}，快进分支 ${#update_branches[@]}，新标签 ${#create_tags[@]}。"
+          for branch in "${!fork_heads[@]}"; do
+            if [ "$branch" != "$CONTROL_BRANCH" ] && [ -z "${upstream_heads[$branch]+present}" ]; then
+              report "Preserved Fork-only branch: $branch -> ${fork_heads[$branch]}"
+            fi
+          done
+          for tag in "${!fork_tags[@]}"; do
+            if [ -z "${upstream_tags[$tag]+present}" ]; then
+              report "Preserved Fork-only tag: $tag -> ${fork_tags[$tag]}"
+            fi
+          done
+
+          report "Plan: ${#create_branches[@]} new branches, ${#update_branches[@]} fast-forwards, ${#create_tags[@]} new tags."
           if [ "$DRY_RUN" = "true" ]; then
-            report "只检查模式完成：零写入。"
+            report "Dry-run complete: zero writes."
             exit 0
           fi
 
-          # 写入前确认上游快照未变化。目标分支则逐个按锁定 SHA 再检查。
           latest_upstream_heads=$(list_refs "$UPSTREAM_REPO" heads)
           latest_upstream_tags=$(list_refs "$UPSTREAM_REPO" tags)
           if [ "$(printf '%s\n' "$latest_upstream_heads" | LC_ALL=C sort)" != "$(printf '%s\n' "$upstream_heads_raw" | LC_ALL=C sort)" ] ||
              [ "$(printf '%s\n' "$latest_upstream_tags" | LC_ALL=C sort)" != "$(printf '%s\n' "$upstream_tags_raw" | LC_ALL=C sort)" ]; then
-            report "::error::规划期间上游引用发生变化，停止本次同步，请重新运行。"
+            report "::error::Upstream refs changed during planning; run again."
             exit 1
           fi
 
-          writes=0
           planned_writes=$((${#create_branches[@]} + ${#update_branches[@]} + ${#create_tags[@]}))
-          [ "$planned_writes" -eq 0 ] || configure_push
 
+          # Recheck every planned target before the first write. Ordinary pushes
+          # remain the final race-safe guard if a ref changes after this snapshot.
           for branch in "${update_branches[@]}"; do
             expected_before=${fork_heads[$branch]}
             latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq '.object.sha')
             if [ "$latest" != "$expected_before" ]; then
-              report "::error::规划期间分支 $branch 被更新，停止本次同步。"
+              report "::error::Target branch $branch changed during planning."
               exit 1
             fi
+          done
+          for branch in "${create_branches[@]}"; do
+            require_ref_absent "heads/$branch"
+          done
+          for tag in "${create_tags[@]}"; do
+            require_ref_absent "tags/$tag"
+          done
+
+          [ "$planned_writes" -eq 0 ] || configure_push
+
+          for branch in "${update_branches[@]}"; do
             source_sha=${upstream_heads[$branch]}
             push_ref heads "$branch" "$source_sha"
             writes=$((writes + 1))
-            report "已快进分支：$branch -> $source_sha"
+            report "Fast-forwarded branch: $branch -> $source_sha"
           done
 
           for branch in "${create_branches[@]}"; do
             source_sha=${upstream_heads[$branch]}
             push_ref heads "$branch" "$source_sha"
             writes=$((writes + 1))
-            report "已创建分支：$branch -> $source_sha"
+            report "Created branch: $branch -> $source_sha"
           done
 
           for tag in "${create_tags[@]}"; do
             source_sha=${upstream_tags[$tag]}
             push_ref tags "$tag" "$source_sha"
             writes=$((writes + 1))
-            report "已复制标签：$tag -> $source_sha"
+            report "Copied tag: $tag -> $source_sha"
           done
 
-          report "同步完成：写入 $writes 个引用；没有 merge、force update 或删除操作。"
+          report "Sync complete: wrote $writes refs; no merge, force update, or delete."
